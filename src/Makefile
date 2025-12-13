@@ -15,7 +15,7 @@ LDFLAGS = -lm
 # CFLAGS = -Wall -Wextra -g -O0 -std=c99 -DDEBUG
 
 # Source files
-SRCS = main.c coordinates.c density_estimator.c hough_transform.c clustering.c io.c utils.c
+SRCS = main.c coordinates.c density_estimator.c hough_transform.c clustering.c io.c utils.c kdtree3d.c
 OBJS = $(SRCS:.c=.o)
 
 # Output binary

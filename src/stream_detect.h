@@ -29,7 +29,7 @@
 #define MAX_LINE_STARS         100       /* Stars for line fitting */
 #define MAX_PROTOCLUSTERS      1000      /* Maximum protoclusters */
 #define MAX_PROTOSTREAMS       500       /* Maximum protostreams */
-#define MAX_STREAM_CANDIDATES  200       /* Maximum final stream candidates */
+#define MAX_STREAM_CANDIDATES  5000      /* Maximum final stream candidates */
 
 /* Algorithm parameters */
 /* Sky patches: 10 sq.deg -> radius = sqrt(10/pi) ~ 1.78 deg */
@@ -312,6 +312,10 @@ typedef struct {
     /* Distance cuts (kpc) */
     double dist_min_kpc;    /* Minimum distance (kpc), default 0 */
     double dist_max_kpc;    /* Maximum distance (kpc), default 1000 */
+    
+    /* KNN dimension options */
+    bool use_distance_knn;  /* Include distance in KNN density (default: false) */
+    bool use_rv_knn;        /* Include RV in KNN density and clustering (default: false) */
     
     /* Output */
     char output_dir[256];

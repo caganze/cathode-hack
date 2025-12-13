@@ -410,44 +410,146 @@ double stream_candidate_compute_significance(StreamCandidate *sc) {
  * @brief Check if two ROIs can be clustered together
  * 
  * ROIs must be from different (independent) signal regions and have
- * compatible proper motions.
+ * compatible proper motions. Optionally checks distance and RV if enabled.
  * 
  * @param roi1 First ROI
  * @param roi2 Second ROI
  * @param pm_threshold Maximum proper motion distance (mas/yr)
+ * @param cfg Configuration (for use_distance_knn, use_rv_knn flags)
  * @return true if ROIs can be clustered
  */
-static bool rois_can_cluster(ROI *roi1, ROI *roi2, double pm_threshold) {
+static bool rois_can_cluster(ROI *roi1, ROI *roi2, double pm_threshold, const Config *cfg) {
     /* ROIs from same SR cannot be clustered (not independent) */
     if (roi1->sr_id == roi2->sr_id) {
         return false;
     }
     
-    /* Check proper motion compatibility */
-    /* Using line stars' proper motions */
+    /* Distance and RV thresholds for compatibility */
+    #define DIST_COMPAT_THRESHOLD  15.0   /* kpc - maximum distance difference */
+    #define DIST_COMPAT_FRAC       0.15   /* or 15% relative difference */
+    #define RV_COMPAT_THRESHOLD    10.0   /* km/s - maximum RV difference between ROIs */
+    #define RV_DISPERSION_MAX      20.0   /* km/s - maximum internal RV dispersion */
+    
+    /* Compute mean properties from top stars in each ROI */
     double mu_phi_1 = 0.0, mu_lambda_1 = 0.0;
     double mu_phi_2 = 0.0, mu_lambda_2 = 0.0;
+    double dist_1 = 0.0, dist_2 = 0.0;
+    double rv_1 = 0.0, rv_2 = 0.0;
+    int n_dist_1 = 0, n_dist_2 = 0;
+    int n_rv_1 = 0, n_rv_2 = 0;
+    
+    int n1 = (roi1->n_selected < 10) ? roi1->n_selected : 10;
+    int n2 = (roi2->n_selected < 10) ? roi2->n_selected : 10;
     
     for (uint32_t i = 0; i < roi1->n_selected && i < 10; i++) {
         mu_phi_1 += roi1->selected_stars[i]->mu_phi;
         mu_lambda_1 += roi1->selected_stars[i]->mu_lambda;
+        
+        /* Accumulate distance if valid */
+        if (roi1->selected_stars[i]->distance > 0.1 && 
+            roi1->selected_stars[i]->distance < 500.0) {
+            dist_1 += roi1->selected_stars[i]->distance;
+            n_dist_1++;
+        }
+        
+        /* Accumulate RV if valid (non-zero and reasonable) */
+        if (fabs(roi1->selected_stars[i]->rv) > 0.001 && 
+            fabs(roi1->selected_stars[i]->rv) < 1000.0) {
+            rv_1 += roi1->selected_stars[i]->rv;
+            n_rv_1++;
+        }
     }
-    int n1 = (roi1->n_selected < 10) ? roi1->n_selected : 10;
     mu_phi_1 /= n1;
     mu_lambda_1 /= n1;
+    if (n_dist_1 > 0) dist_1 /= n_dist_1;
+    if (n_rv_1 > 0) rv_1 /= n_rv_1;
     
     for (uint32_t i = 0; i < roi2->n_selected && i < 10; i++) {
         mu_phi_2 += roi2->selected_stars[i]->mu_phi;
         mu_lambda_2 += roi2->selected_stars[i]->mu_lambda;
+        
+        if (roi2->selected_stars[i]->distance > 0.1 && 
+            roi2->selected_stars[i]->distance < 500.0) {
+            dist_2 += roi2->selected_stars[i]->distance;
+            n_dist_2++;
+        }
+        
+        if (fabs(roi2->selected_stars[i]->rv) > 0.001 && 
+            fabs(roi2->selected_stars[i]->rv) < 1000.0) {
+            rv_2 += roi2->selected_stars[i]->rv;
+            n_rv_2++;
+        }
     }
-    int n2 = (roi2->n_selected < 10) ? roi2->n_selected : 10;
     mu_phi_2 /= n2;
     mu_lambda_2 /= n2;
+    if (n_dist_2 > 0) dist_2 /= n_dist_2;
+    if (n_rv_2 > 0) rv_2 /= n_rv_2;
     
+    /* Check proper motion compatibility */
     double pm_dist = sqrt(pow(mu_phi_1 - mu_phi_2, 2) + 
                           pow(mu_lambda_1 - mu_lambda_2, 2));
+    if (pm_dist >= pm_threshold) {
+        return false;
+    }
     
-    return (pm_dist < pm_threshold);
+    /* Check distance compatibility (if enabled and both have valid distances) */
+    if (cfg && cfg->use_distance_knn && n_dist_1 > 0 && n_dist_2 > 0) {
+        double dist_diff = fabs(dist_1 - dist_2);
+        double mean_dist = (dist_1 + dist_2) / 2.0;
+        double rel_diff = dist_diff / mean_dist;
+        
+        /* Must be within absolute OR relative threshold */
+        if (dist_diff > DIST_COMPAT_THRESHOLD && rel_diff > DIST_COMPAT_FRAC) {
+            return false;
+        }
+    }
+    
+    /* Check RV compatibility (if enabled and both have valid RVs) */
+    if (cfg && cfg->use_rv_knn && n_rv_1 > 0 && n_rv_2 > 0) {
+        /* Check mean RV difference */
+        double rv_diff = fabs(rv_1 - rv_2);
+        if (rv_diff > RV_COMPAT_THRESHOLD) {
+            return false;
+        }
+        
+        /* Also check that combined RV dispersion is low (key for real streams/clusters) */
+        /* Compute combined RV dispersion if we were to merge these ROIs */
+        double combined_mean = (rv_1 * n_rv_1 + rv_2 * n_rv_2) / (n_rv_1 + n_rv_2);
+        double sum_sq = 0.0;
+        int n_total = 0;
+        
+        /* Compute variance for ROI 1 */
+        for (uint32_t i = 0; i < roi1->n_selected && i < 10; i++) {
+            if (fabs(roi1->selected_stars[i]->rv) > 0.001 && 
+                fabs(roi1->selected_stars[i]->rv) < 1000.0) {
+                sum_sq += pow(roi1->selected_stars[i]->rv - combined_mean, 2);
+                n_total++;
+            }
+        }
+        
+        /* Compute variance for ROI 2 */
+        for (uint32_t i = 0; i < roi2->n_selected && i < 10; i++) {
+            if (fabs(roi2->selected_stars[i]->rv) > 0.001 && 
+                fabs(roi2->selected_stars[i]->rv) < 1000.0) {
+                sum_sq += pow(roi2->selected_stars[i]->rv - combined_mean, 2);
+                n_total++;
+            }
+        }
+        
+        if (n_total > 2) {
+            double combined_dispersion = sqrt(sum_sq / (n_total - 1));
+            if (combined_dispersion > RV_DISPERSION_MAX) {
+                return false;  /* RV dispersion too high - not a coherent structure */
+            }
+        }
+    }
+    
+    #undef DIST_COMPAT_THRESHOLD
+    #undef DIST_COMPAT_FRAC
+    #undef RV_COMPAT_THRESHOLD
+    #undef RV_DISPERSION_MAX
+    
+    return true;
 }
 
 /**
@@ -502,7 +604,7 @@ int cluster_rois_to_protoclusters(ROI **rois, int n_rois,
                 /* Check if this ROI can be added */
                 bool can_add = false;
                 for (uint32_t k = 0; k < pc->n_rois; k++) {
-                    if (rois_can_cluster(pc->rois[k], rois[j], pm_threshold)) {
+                    if (rois_can_cluster(pc->rois[k], rois[j], pm_threshold, cfg)) {
                         /* Check line compatibility */
                         if (lines_compatible(pc->rois[k]->theta_line, pc->rois[k]->rho_line,
                                            rois[j]->theta_line, rois[j]->rho_line,
@@ -681,6 +783,12 @@ int merge_protostreams_across_patches(Protostream **protostreams, int n_protostr
             /* Check if clusters overlap and have compatible lines */
             bool should_merge = false;
             
+            /* Distance and RV thresholds for protostream merging */
+            #define MERGE_DIST_THRESHOLD  20.0   /* kpc - maximum distance difference */
+            #define MERGE_DIST_FRAC       0.2    /* or 20% relative difference */
+            #define MERGE_RV_THRESHOLD    15.0   /* km/s - maximum RV difference (tighter for merging) */
+            #define MERGE_RV_DISPERSION   20.0   /* km/s - maximum combined RV dispersion */
+            
             for (uint32_t ci = 0; ci < protostreams[i]->n_clusters && !should_merge; ci++) {
                 Protocluster *pci = protostreams[i]->clusters[ci];
                 if (!pci || pci->n_line_stars == 0) continue;
@@ -698,11 +806,110 @@ int merge_protostreams_across_patches(Protostream **protostreams, int n_protostr
                         if (lines_compatible(pci->theta_line, pci->rho_line,
                                            pcj->theta_line, pcj->rho_line,
                                            cfg->theta_merge_threshold, cfg->rho_merge_threshold)) {
-                            should_merge = true;
+                            
+                            /* Also check distance and RV compatibility */
+                            /* Compute mean distance and RV for each cluster */
+                            double dist_i = 0.0, dist_j = 0.0;
+                            double rv_i = 0.0, rv_j = 0.0;
+                            int n_dist_i = 0, n_dist_j = 0;
+                            int n_rv_i = 0, n_rv_j = 0;
+                            
+                            for (uint32_t s = 0; s < pci->n_line_stars && s < 20; s++) {
+                                if (pci->line_stars[s]->distance > 0.1 && 
+                                    pci->line_stars[s]->distance < 500.0) {
+                                    dist_i += pci->line_stars[s]->distance;
+                                    n_dist_i++;
+                                }
+                                if (fabs(pci->line_stars[s]->rv) > 0.001 && 
+                                    fabs(pci->line_stars[s]->rv) < 1000.0) {
+                                    rv_i += pci->line_stars[s]->rv;
+                                    n_rv_i++;
+                                }
+                            }
+                            
+                            for (uint32_t s = 0; s < pcj->n_line_stars && s < 20; s++) {
+                                if (pcj->line_stars[s]->distance > 0.1 && 
+                                    pcj->line_stars[s]->distance < 500.0) {
+                                    dist_j += pcj->line_stars[s]->distance;
+                                    n_dist_j++;
+                                }
+                                if (fabs(pcj->line_stars[s]->rv) > 0.001 && 
+                                    fabs(pcj->line_stars[s]->rv) < 1000.0) {
+                                    rv_j += pcj->line_stars[s]->rv;
+                                    n_rv_j++;
+                                }
+                            }
+                            
+                            bool dist_ok = true;
+                            bool rv_ok = true;
+                            
+                            /* Check distance compatibility if enabled and both have valid data */
+                            if (cfg->use_distance_knn && n_dist_i > 0 && n_dist_j > 0) {
+                                dist_i /= n_dist_i;
+                                dist_j /= n_dist_j;
+                                double dist_diff = fabs(dist_i - dist_j);
+                                double mean_dist = (dist_i + dist_j) / 2.0;
+                                double rel_diff = dist_diff / mean_dist;
+                                
+                                if (dist_diff > MERGE_DIST_THRESHOLD && 
+                                    rel_diff > MERGE_DIST_FRAC) {
+                                    dist_ok = false;
+                                }
+                            }
+                            
+                            /* Check RV compatibility if enabled and both have valid data */
+                            if (cfg->use_rv_knn && n_rv_i > 0 && n_rv_j > 0) {
+                                double mean_rv_i = rv_i / n_rv_i;
+                                double mean_rv_j = rv_j / n_rv_j;
+                                double rv_diff = fabs(mean_rv_i - mean_rv_j);
+                                
+                                if (rv_diff > MERGE_RV_THRESHOLD) {
+                                    rv_ok = false;
+                                } else {
+                                    /* Also check combined RV dispersion */
+                                    double combined_mean = (rv_i + rv_j) / (n_rv_i + n_rv_j);
+                                    double sum_sq = 0.0;
+                                    int n_total = 0;
+                                    
+                                    /* Variance from cluster i */
+                                    for (uint32_t s = 0; s < pci->n_line_stars && s < 20; s++) {
+                                        if (fabs(pci->line_stars[s]->rv) > 0.001 && 
+                                            fabs(pci->line_stars[s]->rv) < 1000.0) {
+                                            sum_sq += pow(pci->line_stars[s]->rv - combined_mean, 2);
+                                            n_total++;
+                                        }
+                                    }
+                                    
+                                    /* Variance from cluster j */
+                                    for (uint32_t s = 0; s < pcj->n_line_stars && s < 20; s++) {
+                                        if (fabs(pcj->line_stars[s]->rv) > 0.001 && 
+                                            fabs(pcj->line_stars[s]->rv) < 1000.0) {
+                                            sum_sq += pow(pcj->line_stars[s]->rv - combined_mean, 2);
+                                            n_total++;
+                                        }
+                                    }
+                                    
+                                    if (n_total > 2) {
+                                        double combined_dispersion = sqrt(sum_sq / (n_total - 1));
+                                        if (combined_dispersion > MERGE_RV_DISPERSION) {
+                                            rv_ok = false;  /* Too much RV scatter */
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if (dist_ok && rv_ok) {
+                                should_merge = true;
+                            }
                         }
                     }
                 }
             }
+            
+            #undef MERGE_DIST_THRESHOLD
+            #undef MERGE_DIST_FRAC
+            #undef MERGE_RV_THRESHOLD
+            #undef MERGE_RV_DISPERSION
             
             if (should_merge) {
                 uf_unite(parent, i, j);
@@ -729,6 +936,9 @@ int merge_protostreams_across_patches(Protostream **protostreams, int n_protostr
         int root = uf_find(parent, i);
         if (processed[root]) continue;
         
+        /* Note: candidates array is pre-allocated with capacity = n_protostreams
+         * so we're guaranteed to have enough space (worst case: no merging) */
+        
         StreamCandidate *sc = stream_candidate_create();
         if (!sc) {
             free(parent);
@@ -741,14 +951,14 @@ int merge_protostreams_across_patches(Protostream **protostreams, int n_protostr
         for (int j = 0; j < n_protostreams; j++) {
             if (uf_find(parent, j) == root) {
                 stream_candidate_add_protostream(sc, protostreams[j]);
-                if (!protostreams[j]->is_edge) {
+                if (protostreams[j] && !protostreams[j]->is_edge) {
                     has_non_edge = true;
                 }
             }
         }
         
         /* Remove singleton edge protostreams */
-        if (sc->n_protostreams == 1 && protostreams[i]->is_edge) {
+        if (sc->n_protostreams == 1 && protostreams[i] && protostreams[i]->is_edge) {
             stream_candidate_destroy(sc);
             processed[root] = true;
             continue;

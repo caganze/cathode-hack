@@ -360,6 +360,47 @@ static StreamParams diffuse_10x = {
     14400                  /* 1200 * 12 */
 };
 
+/* ============================================================================
+ * Ultra-cold streams with very low RV dispersion (< 5 km/s)
+ * These are the most physically realistic streams for testing RV filtering
+ * ============================================================================ */
+
+/* Pal 5 like: very cold tidal stream from dwarf/GC disruption */
+static StreamParams pal5_like = {
+    "Pal5-like", 120.0, 0.0, -10.0, 10.0, 0.4,  /* Different pole */
+    -2.5, -1.8, 0.3,       /* PM: low dispersion */
+    -58.0, 2.0,            /* RV: mean, VERY low dispersion (2 km/s!) */
+    23.0, 0.5,             /* Distance: well-constrained */
+    3600                   /* 300 * 12 */
+};
+
+/* Ultra-cold stream 1: dynamically cold, recently disrupted */
+static StreamParams ultra_cold_1 = {
+    "UltraCold-1", 60.0, -30.0, -15.0, 15.0, 0.25,
+    -8.0, 2.5, 0.2,        /* Very tight PM */
+    -120.0, 3.0,           /* RV dispersion: 3 km/s */
+    12.0, 0.3,             /* Tight distance */
+    4800                   /* 400 * 12 */
+};
+
+/* Ultra-cold stream 2: different kinematics */
+static StreamParams ultra_cold_2 = {
+    "UltraCold-2", 200.0, 20.0, -20.0, 20.0, 0.35,
+    5.0, -4.0, 0.25,
+    80.0, 4.0,             /* RV dispersion: 4 km/s */
+    8.0, 0.4,
+    4200                   /* 350 * 12 */
+};
+
+/* Hot contaminated stream: good PM but high RV dispersion (should be rejected) */
+static StreamParams hot_contaminant = {
+    "HotContam", 90.0, -10.0, -20.0, 20.0, 0.3,  /* Same geometry as GD1 */
+    -12.0, -3.0, 0.5,      /* Good PM (same as GD1) */
+    0.0, 80.0,             /* HIGH RV dispersion (80 km/s!) - field contamination */
+    10.0, 5.0,             /* Spread in distance */
+    6000                   /* Same star count as GD1 */
+};
+
 /* Globular cluster - compact, spherical, coherent motion */
 typedef struct {
     char name[64];
@@ -502,6 +543,8 @@ static void print_usage(const char *prog) {
     printf("                         rv_multi - RV/distance with multiple streams\n");
     printf("                         rv_gc    - RV/distance with globular cluster\n");
     printf("                         rv_diffuse - RV/distance with diffuse streams\n");
+    printf("                         rv_cold  - Ultra-cold streams (disp < 5 km/s)\n");
+    printf("                         rv_mixed - Cold streams + hot field contaminants\n");
     printf("  --error FRAC         Measurement error fraction (0.0, 0.1, 0.5)\n");
     printf("  -h, --help           Show this help\n");
     printf("\nBackground density:\n");
@@ -655,6 +698,24 @@ int main(int argc, char *argv[]) {
         /* Diffuse streams with RV/distance */
         streams[n_streams++] = &diffuse_5x;
         streams[n_streams++] = &diffuse_10x;
+    } else if (strcmp(scenario, "rv_cold") == 0) {
+        /* Ultra-cold streams with very low RV dispersion (< 5 km/s) */
+        /* These should be easily detectable with RV filtering */
+        streams[n_streams++] = &pal5_like;
+        streams[n_streams++] = &ultra_cold_1;
+        streams[n_streams++] = &ultra_cold_2;
+    } else if (strcmp(scenario, "rv_mixed") == 0) {
+        /* Mix of cold streams and hot contaminants */
+        /* Tests that RV dispersion filtering rejects hot structures */
+        streams[n_streams++] = &pal5_like;      /* Cold: should be detected */
+        streams[n_streams++] = &ultra_cold_1;   /* Cold: should be detected */
+        streams[n_streams++] = &hot_contaminant;/* Hot: should be rejected */
+    } else if (strcmp(scenario, "rv_pal5") == 0) {
+        /* Single Pal 5-like stream for focused testing */
+        streams[n_streams++] = &pal5_like;
+    } else if (strcmp(scenario, "rv_hot") == 0) {
+        /* Only hot contaminant - should be fully rejected */
+        streams[n_streams++] = &hot_contaminant;
     } else {
         fprintf(stderr, "Unknown scenario: %s\n", scenario);
         fclose(f);

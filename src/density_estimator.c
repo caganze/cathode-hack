@@ -17,6 +17,7 @@
 #include <math.h>
 #include <float.h>
 #include "stream_detect.h"
+#include "kdtree3d.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -221,46 +222,49 @@ static int compare_doubles(const void *a, const void *b) {
 }
 
 /**
- * @brief Compute KNN density estimate at a point
+ * @brief Compute KNN density estimate at a point using kd-tree
  * 
- * @param point Point to evaluate (n_dims values)
- * @param data All data points (flattened)
- * @param n_points Number of data points
- * @param n_dims Number of dimensions
+ * @param point Point to evaluate (3D: x, y, z)
+ * @param tree Pre-built kd-tree
  * @param k Number of neighbors
+ * @param n_dims Number of dimensions (must be 3 for kd-tree)
  * @return KNN density estimate
  */
-static double knn_density(const double *point, const double *data,
-                         uint32_t n_points, uint32_t n_dims, int k) {
-    if (n_points < (uint32_t)k) {
-        k = n_points;
+static double knn_density_kdtree(const double *point, const KDTree3D *tree,
+                                  int k, uint32_t n_dims) {
+    if (tree->n_points < k) {
+        k = tree->n_points;
     }
+    if (k < 1) return 0.0;
     
-    /* Compute distances to all points */
-    double *distances = (double *)malloc(n_points * sizeof(double));
-    if (!distances) {
+    /* Query k nearest neighbors */
+    int *neighbor_idx = (int *)malloc(k * sizeof(int));
+    float *neighbor_dist_sq = (float *)malloc(k * sizeof(float));
+    if (!neighbor_idx || !neighbor_dist_sq) {
+        free(neighbor_idx);
+        free(neighbor_dist_sq);
         return 0.0;
     }
     
-    for (uint32_t i = 0; i < n_points; i++) {
-        double dist_sq = 0.0;
-        for (uint32_t d = 0; d < n_dims; d++) {
-            double diff = point[d] - data[i * n_dims + d];
-            dist_sq += diff * diff;
-        }
-        distances[i] = sqrt(dist_sq);
+    int found = kdtree3d_knearest(tree, 
+                                  (float)point[0], (float)point[1], (float)point[2],
+                                  k, neighbor_idx, neighbor_dist_sq);
+    
+    if (found < k) k = found;
+    if (k < 1) {
+        free(neighbor_idx);
+        free(neighbor_dist_sq);
+        return 0.0;
     }
     
-    /* Sort distances */
-    qsort(distances, n_points, sizeof(double), compare_doubles);
-    
     /* Get k-th nearest neighbor distance */
-    double r_k = distances[k - 1];
+    double r_k = sqrt((double)neighbor_dist_sq[k - 1]);
     if (r_k < 1e-10) {
         r_k = 1e-10;  /* Avoid division by zero */
     }
     
-    free(distances);
+    free(neighbor_idx);
+    free(neighbor_dist_sq);
     
     /* Volume of n-dimensional hypersphere: V = pi^(d/2) * r^d / Gamma(d/2 + 1) */
     double log_vol = (n_dims / 2.0) * log(M_PI) + n_dims * log(r_k);
@@ -272,7 +276,7 @@ static double knn_density(const double *point, const double *data,
     double vol = exp(log_vol);
     
     /* Density = k / (n * V) */
-    return (double)k / (n_points * vol);
+    return (double)k / (tree->n_points * vol);
 }
 
 /* ============================================================================
@@ -413,9 +417,10 @@ int compute_anomaly_scores_kde(Patch *patch, SignalRegion *sr, const Config *cfg
 }
 
 /**
- * @brief Compute anomaly scores using KNN density estimation
+ * @brief Compute anomaly scores using KNN density estimation with kd-tree
  * 
- * Simplified version that computes local density and flags overdense stars.
+ * Uses a kd-tree for O(log N) neighbor queries instead of O(N) brute force.
+ * Computes local density and flags overdense stars.
  * 
  * @param patch Patch containing stars
  * @param sr Signal region definition
@@ -436,68 +441,157 @@ int compute_anomaly_scores_knn(Patch *patch, SignalRegion *sr, int k, const Conf
     }
     if (k < 3) k = 3;
     
-    /* Debug: Check proper motion range of SR stars */
-    if (cfg && cfg->verbose && sr->n_sr_stars > 0) {
-        double pmra_min = 1e10, pmra_max = -1e10;
-        double pmdec_min = 1e10, pmdec_max = -1e10;
-        for (uint32_t i = 0; i < sr->n_sr_stars; i++) {
-            Star *s = sr->sr_stars[i];
-            if (s->pmra < pmra_min) pmra_min = s->pmra;
-            if (s->pmra > pmra_max) pmra_max = s->pmra;
-            if (s->pmdec < pmdec_min) pmdec_min = s->pmdec;
-            if (s->pmdec > pmdec_max) pmdec_max = s->pmdec;
+    /* Determine which dimensions to use based on config */
+    bool use_dist = cfg && cfg->use_distance_knn;
+    bool use_rv = cfg && cfg->use_rv_knn;
+    
+    /* Allocate arrays for kd-tree coordinates */
+    float *x = (float *)malloc(sr->n_sr_stars * sizeof(float));
+    float *y = (float *)malloc(sr->n_sr_stars * sizeof(float));
+    float *z = (float *)malloc(sr->n_sr_stars * sizeof(float));
+    
+    if (!x || !y || !z) {
+        free(x); free(y); free(z);
+        return -1;
+    }
+    
+    /* 
+     * Variance-based standardization for unit-less KNN
+     * Each dimension is standardized: (value - mean) / std
+     * This ensures all dimensions contribute equally regardless of units
+     */
+    
+    /* First pass: compute means for each dimension */
+    double mean_phi = 0.0, mean_lambda = 0.0, mean_dist = 0.0, mean_rv = 0.0;
+    int n_valid_dist = 0, n_valid_rv = 0;
+    
+    for (uint32_t i = 0; i < sr->n_sr_stars; i++) {
+        mean_phi += sr->sr_stars[i]->phi;
+        mean_lambda += sr->sr_stars[i]->lambda;
+        
+        if (use_dist && sr->sr_stars[i]->distance > 0.1 && sr->sr_stars[i]->distance < 500.0) {
+            mean_dist += sr->sr_stars[i]->distance;
+            n_valid_dist++;
         }
-        /* Only print for SRs that might contain stream stars (pmra ~ -12, pmdec ~ -3) */
-        if (pmra_min < -8 && pmra_max > -16 && pmdec_min < 0 && pmdec_max > -6) {
-            /* This SR might contain stream stars - but don't print to avoid spam */
+        if (use_rv && fabs(sr->sr_stars[i]->rv) > 0.001 && fabs(sr->sr_stars[i]->rv) < 1000.0) {
+            mean_rv += sr->sr_stars[i]->rv;
+            n_valid_rv++;
+        }
+    }
+    mean_phi /= sr->n_sr_stars;
+    mean_lambda /= sr->n_sr_stars;
+    if (n_valid_dist > 0) mean_dist /= n_valid_dist;
+    if (n_valid_rv > 0) mean_rv /= n_valid_rv;
+    
+    /* Second pass: compute variances */
+    double var_phi = 0.0, var_lambda = 0.0, var_dist = 0.0, var_rv = 0.0;
+    
+    for (uint32_t i = 0; i < sr->n_sr_stars; i++) {
+        var_phi += pow(sr->sr_stars[i]->phi - mean_phi, 2);
+        var_lambda += pow(sr->sr_stars[i]->lambda - mean_lambda, 2);
+        
+        if (use_dist && sr->sr_stars[i]->distance > 0.1 && sr->sr_stars[i]->distance < 500.0) {
+            var_dist += pow(sr->sr_stars[i]->distance - mean_dist, 2);
+        }
+        if (use_rv && fabs(sr->sr_stars[i]->rv) > 0.001 && fabs(sr->sr_stars[i]->rv) < 1000.0) {
+            var_rv += pow(sr->sr_stars[i]->rv - mean_rv, 2);
+        }
+    }
+    var_phi /= sr->n_sr_stars;
+    var_lambda /= sr->n_sr_stars;
+    if (n_valid_dist > 1) var_dist /= n_valid_dist;
+    if (n_valid_rv > 1) var_rv /= n_valid_rv;
+    
+    /* Standard deviations (avoid division by zero) */
+    double std_phi = sqrt(var_phi > 1e-10 ? var_phi : 1e-10);
+    double std_lambda = sqrt(var_lambda > 1e-10 ? var_lambda : 1e-10);
+    double std_dist = sqrt(var_dist > 1e-10 ? var_dist : 1.0);  /* Default 1 if no variance */
+    double std_rv = sqrt(var_rv > 1e-10 ? var_rv : 1.0);
+    
+    /* Third pass: fill standardized coordinates
+     * x = standardized phi
+     * y = standardized lambda  
+     * z = standardized distance (if enabled) or standardized RV (if only RV enabled)
+     *     or combination if both enabled (we'll combine dist+rv into z using weighted sum)
+     */
+    for (uint32_t i = 0; i < sr->n_sr_stars; i++) {
+        x[i] = (float)((sr->sr_stars[i]->phi - mean_phi) / std_phi);
+        y[i] = (float)((sr->sr_stars[i]->lambda - mean_lambda) / std_lambda);
+        
+        if (use_dist && use_rv) {
+            /* Both distance and RV: combine into z as weighted average of standardized values */
+            double std_d = 0.0, std_r = 0.0;
+            double dist = sr->sr_stars[i]->distance;
+            double rv = sr->sr_stars[i]->rv;
+            
+            /* Standardize distance (or use 0 if invalid - neutral) */
+            if (dist > 0.1 && dist < 500.0) {
+                std_d = (dist - mean_dist) / std_dist;
+            }
+            
+            /* Standardize RV (or use 0 if invalid - neutral) */
+            if (fabs(rv) > 0.001 && fabs(rv) < 1000.0) {
+                std_r = (rv - mean_rv) / std_rv;
+            }
+            
+            /* Combine: use Euclidean combination so both contribute */
+            z[i] = (float)(sqrt(std_d * std_d + std_r * std_r) / sqrt(2.0));
+            
+        } else if (use_dist) {
+            /* Only distance */
+            double dist = sr->sr_stars[i]->distance;
+            if (dist > 0.1 && dist < 500.0) {
+                z[i] = (float)((dist - mean_dist) / std_dist);
+            } else {
+                z[i] = 0.0f;  /* Neutral if invalid */
+            }
+            
+        } else if (use_rv) {
+            /* Only RV */
+            double rv = sr->sr_stars[i]->rv;
+            if (fabs(rv) > 0.001 && fabs(rv) < 1000.0) {
+                z[i] = (float)((rv - mean_rv) / std_rv);
+            } else {
+                z[i] = 0.0f;  /* Neutral if invalid */
+            }
+            
+        } else {
+            /* Neither: 2D mode (original behavior) */
+            z[i] = 0.0f;
         }
     }
     
-    /* For each star in the signal region, compute local density */
-    /* based on distance to k-th nearest neighbor */
+    /* Build the kd-tree with standardized coordinates */
+    KDTree3D tree;
+    kdtree3d_init(&tree, 1.0f, 1.0f, 1.0f);  /* All dimensions equally weighted now */
+    if (kdtree3d_build(x, y, z, (int)sr->n_sr_stars, &tree) != 0) {
+        free(x); free(y); free(z);
+        return -1;
+    }
     
-    /* First pass: compute k-th nearest neighbor distance for all SR stars */
+    /* Allocate result arrays */
     double *r_k = (double *)malloc(sr->n_sr_stars * sizeof(double));
-    if (!r_k) return -1;
+    int *neighbor_idx = (int *)malloc((k + 1) * sizeof(int));
+    float *neighbor_dist_sq = (float *)malloc((k + 1) * sizeof(float));
     
+    if (!r_k || !neighbor_idx || !neighbor_dist_sq) {
+        free(r_k); free(neighbor_idx); free(neighbor_dist_sq);
+        free(x); free(y); free(z);
+        kdtree3d_free(&tree);
+        return -1;
+    }
+    
+    /* Query k+1 nearest neighbors for each star (including self) */
     for (uint32_t i = 0; i < sr->n_sr_stars; i++) {
-        Star *s1 = sr->sr_stars[i];
+        int found = kdtree3d_knearest(&tree, x[i], y[i], z[i], 
+                                       k + 1, neighbor_idx, neighbor_dist_sq);
         
-        /* Compute distances to all other SR stars in position space */
-        double *dists = (double *)malloc(sr->n_sr_stars * sizeof(double));
-        if (!dists) {
-            free(r_k);
-            return -1;
-        }
+        /* The first neighbor is the point itself (distance 0), so use k-th after that */
+        int kth_idx = (found > k) ? k : found - 1;
+        if (kth_idx < 0) kth_idx = 0;
         
-        for (uint32_t j = 0; j < sr->n_sr_stars; j++) {
-            if (i == j) {
-                dists[j] = 1e30;  /* Skip self */
-                continue;
-            }
-            Star *s2 = sr->sr_stars[j];
-            
-            /* Use position space distance (phi, lambda) */
-            double d_phi = s1->phi - s2->phi;
-            double d_lambda = s1->lambda - s2->lambda;
-            dists[j] = sqrt(d_phi * d_phi + d_lambda * d_lambda);
-        }
-        
-        /* Find k-th smallest distance (partial sort) */
-        for (int m = 0; m < k; m++) {
-            for (uint32_t j = m + 1; j < sr->n_sr_stars; j++) {
-                if (dists[j] < dists[m]) {
-                    double tmp = dists[m];
-                    dists[m] = dists[j];
-                    dists[j] = tmp;
-                }
-            }
-        }
-        
-        r_k[i] = dists[k - 1];
+        r_k[i] = sqrt((double)neighbor_dist_sq[kth_idx]);
         if (r_k[i] < 0.01) r_k[i] = 0.01;  /* Avoid tiny distances */
-        
-        free(dists);
     }
     
     /* Compute statistics of r_k */
@@ -514,11 +608,16 @@ int compute_anomaly_scores_knn(Patch *patch, SignalRegion *sr, int k, const Conf
     for (uint32_t i = 0; i < sr->n_sr_stars; i++) {
         /* Anomaly score = how much denser than average */
         /* Small r_k means high density */
-        double z = (mean_r - r_k[i]) / std_r;  /* Positive z = overdense */
-        sr->sr_stars[i]->anomaly_score = z;
+        double z_score = (mean_r - r_k[i]) / std_r;  /* Positive z = overdense */
+        sr->sr_stars[i]->anomaly_score = z_score;
     }
     
+    /* Cleanup */
     free(r_k);
+    free(neighbor_idx);
+    free(neighbor_dist_sq);
+    free(x); free(y); free(z);
+    kdtree3d_free(&tree);
     
     return 0;
 }

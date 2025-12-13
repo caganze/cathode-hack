@@ -57,9 +57,9 @@ Config *config_create_default(void) {
     
     /* Clustering parameters */
     cfg->duplicate_overlap = DUPLICATE_OVERLAP;
-    cfg->line_overlap_threshold = 0.1;
-    cfg->theta_merge_threshold = 14.0 * (3.14159265 / 180.0);  /* 14 degrees in radians */
-    cfg->rho_merge_threshold = 1.0;  /* degrees */
+    cfg->line_overlap_threshold = 0.2;  /* Require more overlap to merge (stricter) */
+    cfg->theta_merge_threshold = 10.0 * (3.14159265 / 180.0);  /* 10 degrees in radians (stricter) */
+    cfg->rho_merge_threshold = 0.5;  /* degrees (stricter) */
     
     /* Sky region selection (default: full sky) */
     cfg->ra_min = 0.0;
@@ -70,6 +70,10 @@ Config *config_create_default(void) {
     /* Distance cuts (default: no cut) */
     cfg->dist_min_kpc = 0.0;
     cfg->dist_max_kpc = 1000.0;
+    
+    /* KNN dimension options (default: position only for backward compatibility) */
+    cfg->use_distance_knn = false;
+    cfg->use_rv_knn = false;
     
     /* Output */
     strcpy(cfg->output_dir, "./output");
@@ -138,6 +142,9 @@ static void print_usage(const char *progname) {
     printf("Distance cuts:\n");
     printf("  --dist-min D            Minimum distance in kpc (default: 0)\n");
     printf("  --dist-max D            Maximum distance in kpc (default: 1000)\n\n");
+    printf("KNN dimensions (use additional data for stream detection):\n");
+    printf("  --use-distance          Include distance as a dimension in KNN density\n");
+    printf("  --use-rv                Include radial velocity in KNN and clustering\n\n");
     printf("Examples:\n");
     printf("  %s data.csv --ra-min 100 --ra-max 200 --dec-min -30 --dec-max 30\n", progname);
     printf("  %s data.csv --dist-min 5 --dist-max 50 --sig-cut 10\n\n", progname);
@@ -422,7 +429,9 @@ int run_stream_detection(Star *stars, uint32_t n_stars, const Config *cfg,
      * ======================================================================== */
     printf("Step 3: Merging protostreams across patches...\n");
     
-    *candidates = (StreamCandidate **)malloc(MAX_STREAM_CANDIDATES * sizeof(StreamCandidate *));
+    /* Allocate candidates array based on number of protostreams (worst case: each is separate) */
+    int candidates_capacity = (total_protostreams > 0) ? total_protostreams : 1;
+    *candidates = (StreamCandidate **)malloc(candidates_capacity * sizeof(StreamCandidate *));
     *n_candidates = 0;
     
     if (total_protostreams > 0) {
@@ -436,6 +445,62 @@ int run_stream_detection(Star *stars, uint32_t n_stars, const Config *cfg,
             stream_candidate_compute_significance((*candidates)[i]);
         }
     }
+    
+    /* Filter out candidates that are too large (not streams, but large-scale structure) */
+    /* Real stellar streams have ~50-1000 stars, not 10,000+ */
+    #define MAX_STREAM_STARS 2000  /* Maximum stars in a real stream candidate */
+    #define MIN_STREAM_STARS 10   /* Minimum stars for a credible detection */
+    #define MAX_RV_DISPERSION 20.0 /* km/s - maximum RV dispersion for real streams */
+    
+    int filtered_count = 0;
+    for (int i = 0; i < *n_candidates; i++) {
+        if ((*candidates)[i]) {
+            StreamCandidate *sc = (*candidates)[i];
+            uint32_t n_stars = sc->n_stars;
+            bool pass_star_count = (n_stars >= MIN_STREAM_STARS && n_stars <= MAX_STREAM_STARS);
+            
+            /* Compute RV dispersion if using RV */
+            bool pass_rv_dispersion = true;
+            if (cfg->use_rv_knn && sc->all_stars && n_stars > 5) {
+                double sum_rv = 0.0, sum_rv2 = 0.0;
+                int n_valid_rv = 0;
+                
+                for (uint32_t s = 0; s < n_stars; s++) {
+                    if (sc->all_stars[s] && 
+                        fabs(sc->all_stars[s]->rv) > 0.001 && 
+                        fabs(sc->all_stars[s]->rv) < 1000.0) {
+                        sum_rv += sc->all_stars[s]->rv;
+                        sum_rv2 += sc->all_stars[s]->rv * sc->all_stars[s]->rv;
+                        n_valid_rv++;
+                    }
+                }
+                
+                if (n_valid_rv > 5) {
+                    double mean_rv = sum_rv / n_valid_rv;
+                    double var_rv = sum_rv2 / n_valid_rv - mean_rv * mean_rv;
+                    double rv_dispersion = sqrt(var_rv > 0 ? var_rv : 0);
+                    
+                    if (rv_dispersion > MAX_RV_DISPERSION) {
+                        pass_rv_dispersion = false;
+                    }
+                }
+            }
+            
+            if (pass_star_count && pass_rv_dispersion) {
+                (*candidates)[filtered_count++] = sc;
+            } else {
+                stream_candidate_destroy(sc);
+                (*candidates)[i] = NULL;
+            }
+        }
+    }
+    printf("  Filtered from %d to %d candidates (stars: %d-%d, RV disp: <%.0f km/s)\n", 
+           *n_candidates, filtered_count, MIN_STREAM_STARS, MAX_STREAM_STARS, MAX_RV_DISPERSION);
+    *n_candidates = filtered_count;
+    
+    #undef MAX_STREAM_STARS
+    #undef MIN_STREAM_STARS
+    #undef MAX_RV_DISPERSION
     
     /* Sort by significance (with null checks) */
     for (int i = 0; i < *n_candidates - 1; i++) {
@@ -494,6 +559,8 @@ int main(int argc, char *argv[]) {
         {"dec-max",      required_argument, 0, 1004},
         {"dist-min",     required_argument, 0, 1005},
         {"dist-max",     required_argument, 0, 1006},
+        {"use-distance", no_argument,       0, 1007},
+        {"use-rv",       no_argument,       0, 1008},
         {0, 0, 0, 0}
     };
     
@@ -547,6 +614,14 @@ int main(int argc, char *argv[]) {
                 break;
             case 1006:  /* --dist-max */
                 cfg->dist_max_kpc = atof(optarg);
+                break;
+            case 1007:  /* --use-distance */
+                cfg->use_distance_knn = true;
+                printf("  Using distance in KNN density estimation\n");
+                break;
+            case 1008:  /* --use-rv */
+                cfg->use_rv_knn = true;
+                printf("  Using radial velocity in KNN and clustering\n");
                 break;
             default:
                 print_usage(argv[0]);
