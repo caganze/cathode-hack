@@ -1,0 +1,44 @@
+# Exclude arXiv folder
+arXiv-2509.08064v1/
+
+# Exclude data folders
+data/
+tests/data/
+
+# Compiled binaries and object files
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+
+# Editor and IDE files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Build directories
+build/
+dist/
