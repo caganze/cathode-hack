@@ -75,6 +75,9 @@ Config *config_create_default(void) {
     cfg->use_distance_knn = false;
     cfg->use_rv_knn = false;
     
+    /* Density smoothing (minimum bandwidth to smooth over survey artifacts) */
+    cfg->min_sky_bandwidth = 2.0;  /* degrees - larger than DESI tile spacing (~1.4 deg) */
+    
     /* Output */
     strcpy(cfg->output_dir, "./output");
     cfg->verbose = true;
@@ -85,6 +88,7 @@ Config *config_create_default(void) {
     printf("  sr_width: %.1f mas/yr\n", cfg->sr_width);
     printf("  protocluster_sig_cut: %.1f\n", cfg->protocluster_sig_cut);
     printf("  top_n_anomalous: %d\n", cfg->top_n_anomalous);
+    printf("  min_sky_bandwidth: %.1f deg (smooths over survey artifacts)\n", cfg->min_sky_bandwidth);
     
     return cfg;
 }
@@ -145,6 +149,10 @@ static void print_usage(const char *progname) {
     printf("KNN dimensions (use additional data for stream detection):\n");
     printf("  --use-distance          Include distance as a dimension in KNN density\n");
     printf("  --use-rv                Include radial velocity in KNN and clustering\n\n");
+    printf("Density estimation:\n");
+    printf("  --sky-bandwidth B       Minimum smoothing scale for sky position (deg)\n");
+    printf("                          Default: 2.0 (larger than DESI tile spacing)\n");
+    printf("                          Smooths over survey footprint artifacts\n\n");
     printf("Examples:\n");
     printf("  %s data.csv --ra-min 100 --ra-max 200 --dec-min -30 --dec-max 30\n", progname);
     printf("  %s data.csv --dist-min 5 --dist-max 50 --sig-cut 10\n\n", progname);
@@ -559,8 +567,9 @@ int main(int argc, char *argv[]) {
         {"dec-max",      required_argument, 0, 1004},
         {"dist-min",     required_argument, 0, 1005},
         {"dist-max",     required_argument, 0, 1006},
-        {"use-distance", no_argument,       0, 1007},
-        {"use-rv",       no_argument,       0, 1008},
+        {"use-distance",   no_argument,       0, 1007},
+        {"use-rv",         no_argument,       0, 1008},
+        {"sky-bandwidth",  required_argument, 0, 1009},
         {0, 0, 0, 0}
     };
     
@@ -622,6 +631,10 @@ int main(int argc, char *argv[]) {
             case 1008:  /* --use-rv */
                 cfg->use_rv_knn = true;
                 printf("  Using radial velocity in KNN and clustering\n");
+                break;
+            case 1009:  /* --sky-bandwidth */
+                cfg->min_sky_bandwidth = atof(optarg);
+                printf("  Minimum sky bandwidth: %.1f deg\n", cfg->min_sky_bandwidth);
                 break;
             default:
                 print_usage(argv[0]);

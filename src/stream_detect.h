@@ -263,9 +263,13 @@ typedef struct {
 
 /**
  * @brief Kernel Density Estimator
+ * 
+ * Supports per-dimension bandwidths to properly smooth over
+ * survey artifacts (larger bandwidth for sky position).
  */
 typedef struct {
-    double bandwidth;       /* Kernel bandwidth */
+    double bandwidth;       /* Scalar bandwidth (backward compat) */
+    double *bandwidths;     /* Per-dimension bandwidths (if non-NULL) */
     double *data;           /* Data points (flattened) */
     uint32_t n_points;      /* Number of data points */
     uint32_t n_dims;        /* Number of dimensions */
@@ -316,6 +320,10 @@ typedef struct {
     /* KNN dimension options */
     bool use_distance_knn;  /* Include distance in KNN density (default: false) */
     bool use_rv_knn;        /* Include RV in KNN density and clustering (default: false) */
+    
+    /* Density estimation smoothing scales */
+    double min_sky_bandwidth;  /* Minimum bandwidth for sky position (deg, default: 2.0) */
+                               /* Should be >= survey tile spacing to smooth over artifacts */
     
     /* Output */
     char output_dir[256];

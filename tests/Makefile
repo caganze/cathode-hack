@@ -8,6 +8,7 @@ OUTPUT_DIR = output
 SRC_DIR = ../src
 
 GEN_DATA = generate_test_data
+GEN_DESI = generate_desi_realistic
 DETECTOR = $(SRC_DIR)/stream_detect
 
 # Unit test executables
@@ -45,10 +46,13 @@ run-unit-tests: unit-tests
 $(GEN_DATA): generate_test_data.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
+$(GEN_DESI): generate_desi_realistic.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
 build-detector:
 	$(MAKE) -C $(SRC_DIR)
 
-build: $(GEN_DATA) build-detector
+build: $(GEN_DATA) $(GEN_DESI) build-detector
 
 dirs:
 	@mkdir -p $(DATA_DIR)
@@ -191,21 +195,163 @@ quick: dirs build
 clean:
 	rm -rf $(OUTPUT_DIR)/*
 	rm -f $(DATA_DIR)/*.csv $(DATA_DIR)/*.txt
-	rm -f $(GEN_DATA)
+	rm -f $(GEN_DATA) $(GEN_DESI)
 	rm -f $(TEST_KDTREE) $(TEST_COORDS) $(TEST_RV)
 
 distclean: clean
 	$(MAKE) -C $(SRC_DIR) clean
 
+# ============================================================================
+# DESI-REALISTIC TESTS
+# These simulate actual DESI data characteristics with survey artifacts
+# ============================================================================
+
+# Run DESI test with specified mode
+define run_desi_test
+	@echo "--------------------------------------------------------"
+	@echo "$(1)"
+	@echo "--------------------------------------------------------"
+	./$(GEN_DESI) -o $(DATA_DIR)/$(2).csv --mode $(3) --n-stars $(4) $(5)
+	$(DETECTOR) $(DATA_DIR)/$(2).csv -o $(OUTPUT_DIR)/$(2) $(6)
+	@echo ""
+endef
+
+# Quick DESI test (smaller dataset for fast iteration)
+desi-quick: dirs $(GEN_DESI) build-detector
+	@echo ""
+	@echo "========================================================"
+	@echo "        DESI QUICK TEST (100k background)"
+	@echo "========================================================"
+	@echo ""
+	$(call run_desi_test,Position+PM only (baseline),desi_quick_pospm,pos_pm,100000,--streams 0,-q)
+	@echo "Results in: $(OUTPUT_DIR)/desi_quick_pospm/"
+
+# DESI tests with different modes - 500k stars (medium size)
+desi-medium: dirs $(GEN_DESI) build-detector
+	@echo ""
+	@echo "========================================================"
+	@echo "  DESI MEDIUM TESTS (500k background - each mode)"
+	@echo "========================================================"
+	@echo ""
+	$(call run_desi_test,Mode: pos_pm (Position+PM only),desi_med_pospm,pos_pm,500000,--streams all,-q)
+	$(call run_desi_test,Mode: with_dist (+Distance),desi_med_dist,with_dist,500000,--streams all,-q --use-distance)
+	$(call run_desi_test,Mode: with_rv (+RV),desi_med_rv,with_rv,500000,--streams all,-q --use-rv)
+	$(call run_desi_test,Mode: full (Distance+RV),desi_med_full,full,500000,--streams all,-q --use-distance --use-rv)
+	@# Summary
+	@echo "========================================================"
+	@echo "              DESI MEDIUM TEST SUMMARY"
+	@echo "========================================================"
+	@echo ""
+	@echo "Mode            | Candidates | Stars in top candidate"
+	@echo "----------------|------------|------------------------"
+	@printf "pos_pm          |"
+	@wc -l $(OUTPUT_DIR)/desi_med_pospm/stream_candidates.csv 2>/dev/null | awk '{printf " %10d |\n", $$1-1}'
+	@printf "with_dist       |"
+	@wc -l $(OUTPUT_DIR)/desi_med_dist/stream_candidates.csv 2>/dev/null | awk '{printf " %10d |\n", $$1-1}'
+	@printf "with_rv         |"
+	@wc -l $(OUTPUT_DIR)/desi_med_rv/stream_candidates.csv 2>/dev/null | awk '{printf " %10d |\n", $$1-1}'
+	@printf "full            |"
+	@wc -l $(OUTPUT_DIR)/desi_med_full/stream_candidates.csv 2>/dev/null | awk '{printf " %10d |\n", $$1-1}'
+	@echo ""
+	@echo "Results in: $(OUTPUT_DIR)/desi_med_*/"
+
+# DESI full-scale tests (1.1M stars - matches real data)
+desi-full: dirs $(GEN_DESI) build-detector
+	@echo ""
+	@echo "========================================================"
+	@echo "  DESI FULL-SCALE TESTS (1.1M stars - like real data)"
+	@echo "========================================================"
+	@echo ""
+	$(call run_desi_test,Mode: pos_pm (baseline),desi_full_pospm,pos_pm,1100000,--streams all,-q)
+	$(call run_desi_test,Mode: with_dist,desi_full_dist,with_dist,1100000,--streams all,-q --use-distance)
+	$(call run_desi_test,Mode: with_rv,desi_full_rv,with_rv,1100000,--streams all,-q --use-rv)
+	$(call run_desi_test,Mode: full (all dimensions),desi_full_full,full,1100000,--streams all,-q --use-distance --use-rv)
+	@# Summary
+	@echo "========================================================"
+	@echo "              DESI FULL-SCALE TEST SUMMARY"
+	@echo "========================================================"
+	@echo ""
+	@echo "Mode            | Candidates"
+	@echo "----------------|------------"
+	@printf "pos_pm          |"
+	@wc -l $(OUTPUT_DIR)/desi_full_pospm/stream_candidates.csv 2>/dev/null | awk '{printf " %10d\n", $$1-1}'
+	@printf "with_dist       |"
+	@wc -l $(OUTPUT_DIR)/desi_full_dist/stream_candidates.csv 2>/dev/null | awk '{printf " %10d\n", $$1-1}'
+	@printf "with_rv         |"
+	@wc -l $(OUTPUT_DIR)/desi_full_rv/stream_candidates.csv 2>/dev/null | awk '{printf " %10d\n", $$1-1}'
+	@printf "full            |"
+	@wc -l $(OUTPUT_DIR)/desi_full_full/stream_candidates.csv 2>/dev/null | awk '{printf " %10d\n", $$1-1}'
+	@echo ""
+	@echo "Results in: $(OUTPUT_DIR)/desi_full_*/"
+
+# Null test - no streams injected (false positive rate)
+desi-null: dirs $(GEN_DESI) build-detector
+	@echo ""
+	@echo "========================================================"
+	@echo "  DESI NULL TEST (no streams - false positive check)"
+	@echo "========================================================"
+	@echo ""
+	$(call run_desi_test,Null test - pos_pm,desi_null_pospm,pos_pm,500000,--no-streams,-q)
+	$(call run_desi_test,Null test - with_rv,desi_null_rv,with_rv,500000,--no-streams,-q --use-rv)
+	$(call run_desi_test,Null test - full,desi_null_full,full,500000,--no-streams,-q --use-distance --use-rv)
+	@echo "========================================================"
+	@echo "              NULL TEST SUMMARY (should be ~0)"
+	@echo "========================================================"
+	@echo ""
+	@echo "Mode            | False Positives"
+	@echo "----------------|----------------"
+	@printf "pos_pm          |"
+	@wc -l $(OUTPUT_DIR)/desi_null_pospm/stream_candidates.csv 2>/dev/null | awk '{printf " %10d\n", $$1-1}'
+	@printf "with_rv         |"
+	@wc -l $(OUTPUT_DIR)/desi_null_rv/stream_candidates.csv 2>/dev/null | awk '{printf " %10d\n", $$1-1}'
+	@printf "full            |"
+	@wc -l $(OUTPUT_DIR)/desi_null_full/stream_candidates.csv 2>/dev/null | awk '{printf " %10d\n", $$1-1}'
+
+# Single stream isolation tests
+desi-single: dirs $(GEN_DESI) build-detector
+	@echo ""
+	@echo "========================================================"
+	@echo "  DESI SINGLE STREAM TESTS (isolate each stream)"
+	@echo "========================================================"
+	@echo ""
+	$(call run_desi_test,GD1-like (cold thin),desi_gd1,full,500000,--streams 0,-q --use-distance --use-rv)
+	$(call run_desi_test,Pal5-like (ultra-cold RV),desi_pal5,full,500000,--streams 1,-q --use-distance --use-rv)
+	$(call run_desi_test,Orphan-like (diffuse),desi_orphan,full,500000,--streams 2,-q --use-distance --use-rv)
+	$(call run_desi_test,Sgr-leading (extended),desi_sgr,full,500000,--streams 3,-q --use-distance --use-rv)
+	$(call run_desi_test,Faint-thin (challenging),desi_faint,full,500000,--streams 4,-q --use-distance --use-rv)
+	@echo "Results in: $(OUTPUT_DIR)/desi_*/"
+
+# All DESI tests
+desi-all: desi-quick desi-medium desi-full desi-null desi-single
+	@echo ""
+	@echo "========================================================"
+	@echo "           ALL DESI TESTS COMPLETE"
+	@echo "========================================================"
+
 help:
 	@echo "Stream Detection Test Suite"
 	@echo ""
+	@echo "=== BASIC TESTS ==="
 	@echo "  make build           - Build everything"
 	@echo "  make test            - Run ALL integration tests"
 	@echo "  make unit-tests      - Build unit tests"
 	@echo "  make run-unit-tests  - Run unit tests (kdtree, coords, RV dispersion)"
 	@echo "  make quick           - Quick test"
 	@echo "  make clean           - Remove outputs"
+	@echo ""
+	@echo "=== DESI-REALISTIC TESTS ==="
+	@echo "  make desi-quick      - Quick DESI test (100k stars, ~30s)"
+	@echo "  make desi-medium     - Medium DESI tests (500k stars, all modes)"
+	@echo "  make desi-full       - Full-scale DESI tests (1.1M stars)"
+	@echo "  make desi-null       - Null test (no streams, false positive check)"
+	@echo "  make desi-single     - Test each stream type individually"
+	@echo "  make desi-all        - Run ALL DESI tests"
+	@echo ""
+	@echo "DESI test modes:"
+	@echo "  pos_pm    - Position + proper motion only"
+	@echo "  with_dist - + Distance information"
+	@echo "  with_rv   - + Radial velocity"
+	@echo "  full      - All dimensions (distance + RV)"
 	@echo ""
 	@echo "Unit Tests:"
 	@echo "  - test_kdtree       - KD-tree construction and queries"
@@ -229,3 +375,4 @@ help:
 	@echo "Error levels: 0%, 10%, 50%"
 
 .PHONY: all build build-detector dirs test quick clean distclean help unit-tests run-unit-tests
+.PHONY: desi-quick desi-medium desi-full desi-null desi-single desi-all

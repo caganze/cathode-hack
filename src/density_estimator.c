@@ -27,8 +27,22 @@
  * Kernel Density Estimation
  * ============================================================================ */
 
+/* 
+ * Minimum bandwidths for different dimensions to smooth over survey artifacts.
+ * 
+ * DESI tiles are ~1.6 deg radius with ~1.4 deg spacing. To properly smooth
+ * over the hexagonal tile pattern, we need bandwidths > tile spacing.
+ * 
+ * - Sky position (phi, lambda): min 2.0 deg to smooth over tile artifacts
+ * - Proper motion: no minimum (use Silverman's rule)
+ * - Distance: no minimum
+ * - RV: no minimum
+ */
+#define MIN_BANDWIDTH_SKY_DEG    2.0    /* Minimum for phi, lambda dimensions */
+#define MIN_BANDWIDTH_PM_MASYR   0.0    /* No minimum for PM (smoother in data) */
+
 /**
- * @brief Create a new KDE estimator
+ * @brief Create a new KDE estimator with per-dimension bandwidths
  * 
  * @param n_dims Number of dimensions
  * @return Newly allocated KDE, or NULL on error
@@ -41,6 +55,7 @@ KDE *kde_create(uint32_t n_dims) {
     
     kde->n_dims = n_dims;
     kde->bandwidth = KDE_DEFAULT_BANDWIDTH;
+    kde->bandwidths = NULL;  /* Will be allocated in kde_fit */
     kde->data = NULL;
     kde->n_points = 0;
     
@@ -54,9 +69,8 @@ KDE *kde_create(uint32_t n_dims) {
  */
 void kde_destroy(KDE *kde) {
     if (kde) {
-        if (kde->data) {
-            free(kde->data);
-        }
+        free(kde->data);
+        free(kde->bandwidths);
         free(kde);
     }
 }
@@ -125,7 +139,15 @@ double kde_bandwidth_silverman(const double *data, uint32_t n) {
 }
 
 /**
- * @brief Fit the KDE to data
+ * @brief Fit the KDE to data with per-dimension bandwidths
+ * 
+ * Uses Silverman's rule for each dimension, but enforces minimum
+ * bandwidths for sky position dimensions to smooth over survey
+ * artifacts like DESI's hexagonal tile pattern (~1.6 deg tiles).
+ * 
+ * Dimension layout expected: [phi, lambda, mu_perp, ...]
+ * - Dimensions 0,1 (sky position): min 2.0 deg bandwidth
+ * - Other dimensions: Silverman's rule only
  * 
  * @param kde KDE to fit
  * @param data 2D array of data points (n_points x n_dims)
@@ -143,6 +165,14 @@ int kde_fit(KDE *kde, double **data, uint32_t n_points) {
         return -1;
     }
     
+    /* Allocate per-dimension bandwidths */
+    kde->bandwidths = (double *)malloc(kde->n_dims * sizeof(double));
+    if (!kde->bandwidths) {
+        free(kde->data);
+        kde->data = NULL;
+        return -1;
+    }
+    
     /* Copy and flatten data */
     for (uint32_t i = 0; i < n_points; i++) {
         for (uint32_t d = 0; d < kde->n_dims; d++) {
@@ -152,29 +182,52 @@ int kde_fit(KDE *kde, double **data, uint32_t n_points) {
     
     kde->n_points = n_points;
     
-    /* Compute bandwidth per dimension and take geometric mean */
+    /* Compute per-dimension bandwidths with minimum thresholds */
     double log_h_sum = 0.0;
     for (uint32_t d = 0; d < kde->n_dims; d++) {
         double *col = (double *)malloc(n_points * sizeof(double));
-        if (!col) continue;
+        if (!col) {
+            kde->bandwidths[d] = KDE_DEFAULT_BANDWIDTH;
+            log_h_sum += log(KDE_DEFAULT_BANDWIDTH);
+            continue;
+        }
         
         for (uint32_t i = 0; i < n_points; i++) {
             col[i] = data[i][d];
         }
         
         double h_d = kde_bandwidth_silverman(col, n_points);
+        
+        /* Apply minimum bandwidth for sky position dimensions (0 and 1)
+         * to smooth over DESI tile pattern (~1.6 deg tiles, ~1.4 deg spacing).
+         * Using 2.0 deg ensures we don't pick up tile edges as real structure.
+         */
+        if (d < 2) {
+            /* Sky position dimensions: phi and lambda */
+            if (h_d < MIN_BANDWIDTH_SKY_DEG) {
+                h_d = MIN_BANDWIDTH_SKY_DEG;
+            }
+        }
+        /* PM and other dimensions: use Silverman's rule as-is */
+        
+        kde->bandwidths[d] = h_d;
         log_h_sum += log(h_d);
         
         free(col);
     }
     
+    /* Also store geometric mean for backward compatibility */
     kde->bandwidth = exp(log_h_sum / kde->n_dims);
     
     return 0;
 }
 
 /**
- * @brief Evaluate KDE at a point using Gaussian kernel
+ * @brief Evaluate KDE at a point using Gaussian kernel with per-dimension bandwidths
+ * 
+ * Uses a product of 1D Gaussian kernels, each with its own bandwidth.
+ * This allows different smoothing scales for sky position (large, to smooth
+ * over survey artifacts) vs proper motion (data-driven).
  * 
  * @param kde Fitted KDE
  * @param point Point to evaluate at (n_dims values)
@@ -185,6 +238,34 @@ double kde_evaluate(const KDE *kde, const double *point) {
         return 0.0;
     }
     
+    /* Use per-dimension bandwidths if available */
+    if (kde->bandwidths) {
+        /* Product kernel: K(x) = prod_d K_d(x_d / h_d) / h_d */
+        double log_norm = 0.0;
+        for (uint32_t d = 0; d < kde->n_dims; d++) {
+            double h_d = kde->bandwidths[d];
+            log_norm += -0.5 * log(2 * M_PI) - log(h_d);
+        }
+        double norm = exp(log_norm);
+        
+        double sum = 0.0;
+        for (uint32_t i = 0; i < kde->n_points; i++) {
+            double log_kernel = 0.0;
+            
+            for (uint32_t d = 0; d < kde->n_dims; d++) {
+                double h_d = kde->bandwidths[d];
+                double diff = point[d] - kde->data[i * kde->n_dims + d];
+                double z = diff / h_d;
+                log_kernel += -0.5 * z * z;
+            }
+            
+            sum += exp(log_kernel);
+        }
+        
+        return norm * sum / kde->n_points;
+    }
+    
+    /* Fallback: use scalar bandwidth (backward compatibility) */
     double h = kde->bandwidth;
     double h_sq = h * h;
     double norm = pow(2 * M_PI * h_sq, -0.5 * kde->n_dims);
@@ -313,6 +394,8 @@ static void extract_features(const Star *star, double *features, bool use_mu_lam
  * @brief Compute anomaly scores using KDE
  * 
  * Trains KDE on sideband and evaluates density ratio for signal region stars.
+ * Uses per-dimension bandwidths with minimum scale for sky positions to
+ * smooth over survey artifacts.
  * 
  * @param patch Patch containing stars
  * @param sr Signal region definition
@@ -320,13 +403,15 @@ static void extract_features(const Star *star, double *features, bool use_mu_lam
  * @return 0 on success, error code otherwise
  */
 int compute_anomaly_scores_kde(Patch *patch, SignalRegion *sr, const Config *cfg) {
-    (void)cfg;  /* Currently unused */
-    
     if (!patch || !sr || sr->n_sb_stars < 100) {
         return -1;
     }
     
-    printf("Computing KDE anomaly scores...\n");
+    /* Get minimum sky bandwidth from config (default 2.0 deg) */
+    double min_sky_bw = (cfg && cfg->min_sky_bandwidth > 0) ? 
+                         cfg->min_sky_bandwidth : MIN_BANDWIDTH_SKY_DEG;
+    
+    printf("Computing KDE anomaly scores (min_sky_bandwidth=%.1f deg)...\n", min_sky_bw);
     printf("  SR stars: %u, SB stars: %u\n", sr->n_sr_stars, sr->n_sb_stars);
     
     /* Extract features from sideband */
@@ -422,6 +507,11 @@ int compute_anomaly_scores_kde(Patch *patch, SignalRegion *sr, const Config *cfg
  * Uses a kd-tree for O(log N) neighbor queries instead of O(N) brute force.
  * Computes local density and flags overdense stars.
  * 
+ * IMPORTANT: Uses standardization with minimum scale for spatial dimensions
+ * to smooth over survey artifacts. The effective smoothing scale for sky
+ * positions is max(data_std, MIN_BANDWIDTH_SKY_DEG), ensuring we don't
+ * pick up DESI tile edges as real overdensities.
+ * 
  * @param patch Patch containing stars
  * @param sr Signal region definition
  * @param k Number of neighbors for KNN
@@ -502,9 +592,27 @@ int compute_anomaly_scores_knn(Patch *patch, SignalRegion *sr, int k, const Conf
     if (n_valid_dist > 1) var_dist /= n_valid_dist;
     if (n_valid_rv > 1) var_rv /= n_valid_rv;
     
-    /* Standard deviations (avoid division by zero) */
+    /* Standard deviations (avoid division by zero)
+     * 
+     * IMPORTANT: Use minimum smoothing scale for spatial dimensions to smooth
+     * over survey artifacts like DESI's hexagonal tile pattern (~1.6 deg tiles).
+     * This prevents tile edges from being flagged as real overdensities.
+     */
     double std_phi = sqrt(var_phi > 1e-10 ? var_phi : 1e-10);
     double std_lambda = sqrt(var_lambda > 1e-10 ? var_lambda : 1e-10);
+    
+    /* Get minimum sky bandwidth from config (default 2.0 deg) */
+    double min_sky_bw = (cfg && cfg->min_sky_bandwidth > 0) ? 
+                         cfg->min_sky_bandwidth : MIN_BANDWIDTH_SKY_DEG;
+    
+    /* Enforce minimum smoothing scale for sky positions */
+    if (std_phi < min_sky_bw) {
+        std_phi = min_sky_bw;
+    }
+    if (std_lambda < min_sky_bw) {
+        std_lambda = min_sky_bw;
+    }
+    
     double std_dist = sqrt(var_dist > 1e-10 ? var_dist : 1.0);  /* Default 1 if no variance */
     double std_rv = sqrt(var_rv > 1e-10 ? var_rv : 1.0);
     

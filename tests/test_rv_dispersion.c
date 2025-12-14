@@ -325,8 +325,10 @@ void test_threshold_5kms(void) {
     bool gd1_passes = (disp_gd1 < THRESHOLD);
     bool m4_passes = (disp_m4 < THRESHOLD);
     
-    printf("    GD-1: %.2f km/s vs threshold %.1f km/s\n", disp_gd1, THRESHOLD);
-    printf("    M4:   %.2f km/s vs threshold %.1f km/s\n", disp_m4, THRESHOLD);
+    printf("    GD-1: %.2f km/s vs threshold %.1f km/s -> %s\n", 
+           disp_gd1, THRESHOLD, gd1_passes ? "PASS" : "FAIL");
+    printf("    M4:   %.2f km/s vs threshold %.1f km/s -> %s\n", 
+           disp_m4, THRESHOLD, m4_passes ? "PASS" : "FAIL");
     
     /* M4 should definitely pass (GCs are very cold) */
     test_result("Very cold GC passes 5 km/s cut", m4_passes);
@@ -407,11 +409,11 @@ void test_two_values(void) {
     
     double disp = compute_rv_dispersion(rv_two, valid, n);
     
-    /* With 2 values, std = |a-b| / sqrt(2) for sample std */
-    double expected = 10.0 / sqrt(2.0) * sqrt(2.0 / 1.0);  /* Sample std with n-1 */
+    /* With 2 values and sample std (n-1), std = |a-b| / sqrt(2) * sqrt(2) = |a-b| */
+    double expected = 10.0;  /* sqrt(sum_sq / 1) where sum_sq = 2 * 5^2 = 50 */
     
     printf("    Dispersion of [-150, -140] = %.4f km/s (expected ~%.4f)\n", 
-           disp, 10.0);
+           disp, expected);
     
     test_result("Two values give reasonable dispersion", disp > 5.0 && disp < 15.0);
 }
